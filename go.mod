@@ -1,4 +1,4 @@
-module github.com/balena-os/librsync-go
+module github.com/gurupras/librsync-go
 
 go 1.16
 
