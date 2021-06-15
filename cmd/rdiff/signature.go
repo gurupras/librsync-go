@@ -7,7 +7,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 
-	"github.com/balena-os/librsync-go"
+	"github.com/gurupras/librsync-go"
 )
 
 func CommandSignature(c *cli.Context) {
