@@ -16,11 +16,11 @@ const (
 )
 
 type SignatureType struct {
-	sigType    MagicNumber
-	blockLen   uint32
-	strongLen  uint32
-	strongSigs [][]byte
-	weak2block map[uint32]int
+	SigType    MagicNumber
+	BlockLen   uint32
+	StrongLen  uint32
+	StrongSigs [][]byte
+	Weak2block map[uint32]int
 }
 
 func CalcStrongSum(data []byte, sigType MagicNumber, strongLen uint32) ([]byte, error) {
@@ -68,10 +68,10 @@ func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, si
 	block := make([]byte, blockLen)
 
 	var ret SignatureType
-	ret.weak2block = make(map[uint32]int)
-	ret.sigType = sigType
-	ret.strongLen = strongLen
-	ret.blockLen = blockLen
+	ret.Weak2block = make(map[uint32]int)
+	ret.SigType = sigType
+	ret.StrongLen = strongLen
+	ret.BlockLen = blockLen
 
 	for {
 		n, err := io.ReadAtLeast(input, block, int(blockLen))
@@ -101,8 +101,8 @@ func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, si
 		strong, _ := CalcStrongSum(data, sigType, strongLen)
 		output.Write(strong)
 
-		ret.weak2block[weak] = len(ret.strongSigs)
-		ret.strongSigs = append(ret.strongSigs, strong)
+		ret.Weak2block[weak] = len(ret.StrongSigs)
+		ret.StrongSigs = append(ret.StrongSigs, strong)
 	}
 
 	return &ret, nil
@@ -151,11 +151,11 @@ func ReadSignature(r io.Reader) (*SignatureType, error) {
 	}
 
 	return &SignatureType{
-		sigType:    magic,
-		blockLen:   blockLen,
-		strongLen:  strongLen,
-		strongSigs: strongSigs,
-		weak2block: weak2block,
+		SigType:    magic,
+		BlockLen:   blockLen,
+		StrongLen:  strongLen,
+		StrongSigs: strongSigs,
+		Weak2block: weak2block,
 	}, nil
 }
 
