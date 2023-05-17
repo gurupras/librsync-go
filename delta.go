@@ -31,7 +31,7 @@ func Delta(sig *SignatureType, i io.Reader, output io.Writer) error {
 //	  _ = DeltaBuff(sig, f, delta, litBuff)
 //	}
 func DeltaBuff(sig *SignatureType, i io.Reader, output io.Writer, litBuff []byte) error {
-	if len(litBuff) != 0 || cap(litBuff) != OUTPUT_BUFFER_SIZE {
+	if len(litBuff) != 0 || cap(litBuff) != int(OUTPUT_BUFFER_SIZE) {
 		return fmt.Errorf("bad literal buffer")
 	}
 

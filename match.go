@@ -16,7 +16,7 @@ const (
 // Size of the output buffer in bytes. We'll flush the match once it gets this
 // large. As consequence, this is the maximum size of a LITERAL command we'll
 // generate on our deltas.
-const OUTPUT_BUFFER_SIZE = 16 * 1024 * 1024
+var OUTPUT_BUFFER_SIZE = uint64(16 * 1024 * 1024)
 
 type match struct {
 	kind   matchKind
