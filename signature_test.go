@@ -16,7 +16,7 @@ type errorI interface {
 	Error(args ...interface{})
 }
 
-func signature(t errorI, src io.Reader) *SignatureType {
+func testSignature(t errorI, src io.Reader) *SignatureType {
 	var (
 		magic            = BLAKE2_SIG_MAGIC
 		blockLen  uint32 = 512

@@ -1,6 +1,7 @@
 package librsync
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -23,20 +24,14 @@ type SignatureType struct {
 	Weak2block map[uint32]int
 }
 
-func CalcStrongSum(data []byte, sigType MagicNumber, strongLen uint32) ([]byte, error) {
-	switch sigType {
-	case BLAKE2_SIG_MAGIC:
-		d := blake2b.Sum256(data)
-		return d[:strongLen], nil
-	case MD4_SIG_MAGIC:
-		d := md4.New()
-		d.Write(data)
-		return d.Sum(nil)[:strongLen], nil
-	}
-	return nil, fmt.Errorf("Invalid sigType %#x", sigType)
+type signature struct {
+	*SignatureType
+	maxStrongLen uint32
+	block        []byte
+	output       io.Writer
 }
 
-func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, sigType MagicNumber) (*SignatureType, error) {
+func NewSignature(sigType MagicNumber, blockLen, strongLen uint32, output io.Writer) (*signature, error) {
 	var maxStrongLen uint32
 
 	switch sigType {
@@ -52,6 +47,19 @@ func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, si
 		return nil, fmt.Errorf("invalid strongLen %d for sigType %#x", strongLen, sigType)
 	}
 
+	ret := &signature{
+		SignatureType: &SignatureType{
+			SigType:    sigType,
+			BlockLen:   blockLen,
+			StrongLen:  strongLen,
+			Weak2block: make(map[uint32]int),
+			StrongSigs: make([][]byte, 0),
+		},
+		maxStrongLen: maxStrongLen,
+		block:        make([]byte, blockLen),
+		output:       output,
+	}
+
 	err := binary.Write(output, binary.BigEndian, sigType)
 	if err != nil {
 		return nil, err
@@ -65,16 +73,17 @@ func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, si
 		return nil, err
 	}
 
-	block := make([]byte, blockLen)
+	return ret, nil
+}
 
-	var ret SignatureType
-	ret.Weak2block = make(map[uint32]int)
-	ret.SigType = sigType
-	ret.StrongLen = strongLen
-	ret.BlockLen = blockLen
+func (s *signature) Digest(b []byte) error {
+	buf := bytes.NewBuffer(b)
+	return s.DigestReader(buf)
+}
 
+func (s *signature) DigestReader(reader io.Reader) error {
 	for {
-		n, err := io.ReadAtLeast(input, block, int(blockLen))
+		n, err := io.ReadAtLeast(reader, s.block, int(s.BlockLen))
 		if err == io.EOF {
 			// We reached the end of the input, we are done with the signature
 			break
@@ -87,25 +96,54 @@ func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, si
 			// No real error, got data. Leave this `if` and checksum this block
 		} else if err != nil {
 			// Got a real error, report it back to the caller
-			return nil, err
+			return err
 		}
 
-		data := block[:n]
+		data := s.block[:n]
 
 		weak := WeakChecksum(data)
-		err = binary.Write(output, binary.BigEndian, weak)
+		err = binary.Write(s.output, binary.BigEndian, weak)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
-		strong, _ := CalcStrongSum(data, sigType, strongLen)
-		output.Write(strong)
+		strong, _ := CalcStrongSum(data, s.SigType, s.StrongLen)
+		s.output.Write(strong)
 
-		ret.Weak2block[weak] = len(ret.StrongSigs)
-		ret.StrongSigs = append(ret.StrongSigs, strong)
+		s.Weak2block[weak] = len(s.StrongSigs)
+		s.StrongSigs = append(s.StrongSigs, strong)
+	}
+	return nil
+}
+
+func (s *signature) End() *SignatureType {
+	return s.SignatureType
+}
+
+func CalcStrongSum(data []byte, sigType MagicNumber, strongLen uint32) ([]byte, error) {
+	switch sigType {
+	case BLAKE2_SIG_MAGIC:
+		d := blake2b.Sum256(data)
+		return d[:strongLen], nil
+	case MD4_SIG_MAGIC:
+		d := md4.New()
+		d.Write(data)
+		return d.Sum(nil)[:strongLen], nil
+	}
+	return nil, fmt.Errorf("invalid sigType %#x", sigType)
+}
+
+func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, sigType MagicNumber) (*SignatureType, error) {
+	sig, err := NewSignature(sigType, blockLen, strongLen, output)
+	if err != nil {
+		return nil, err
 	}
 
-	return &ret, nil
+	err = sig.DigestReader(input)
+	if err != nil {
+		return nil, err
+	}
+	return sig.End(), nil
 }
 
 // ReadSignature reads a signature from an io.Reader.

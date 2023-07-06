@@ -25,7 +25,7 @@ func TestDeltaSmokeTest(t *testing.T) {
 		io.LimitReader(rand.New(rand.NewSource(time.Now().UnixNano())), totalBytes),
 		&srcBuf)
 
-	s := signature(t, src)
+	s := testSignature(t, src)
 
 	var buf bytes.Buffer
 
