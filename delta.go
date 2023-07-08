@@ -25,6 +25,7 @@ func (d *DeltaStruct) Digest(b []byte) error {
 }
 
 func (d *DeltaStruct) digestReader(input io.ByteReader) error {
+	blockLenu64 := uint64(d.sig.BlockLen)
 	for {
 		in, err := input.ReadByte()
 		if err == io.EOF {
@@ -41,11 +42,11 @@ func (d *DeltaStruct) digestReader(input io.ByteReader) error {
 		d.block.WriteByte(in)
 		d.weakSum.Rollin(in)
 
-		if d.weakSum.count < uint64(d.sig.BlockLen) {
+		if d.weakSum.count < blockLenu64 {
 			continue
 		}
 
-		if d.weakSum.count > uint64(d.sig.BlockLen) {
+		if d.weakSum.count > blockLenu64 {
 			err := d.match.add(MATCH_KIND_LITERAL, uint64(d.prevByte), 1)
 			if err != nil {
 				return err
@@ -58,7 +59,7 @@ func (d *DeltaStruct) digestReader(input io.ByteReader) error {
 			if bytes.Equal(d.sig.StrongSigs[blockIdx], strong2) {
 				d.weakSum.Reset()
 				d.block.Reset()
-				err := d.match.add(MATCH_KIND_COPY, uint64(blockIdx)*uint64(d.sig.BlockLen), uint64(d.sig.BlockLen))
+				err := d.match.add(MATCH_KIND_COPY, uint64(blockIdx)*blockLenu64, blockLenu64)
 				if err != nil {
 					return err
 				}
