@@ -24,23 +24,33 @@ func (d *DeltaStruct) Digest(b []byte) error {
 	return d.digestReader(buf)
 }
 
-func (d *DeltaStruct) digestReader(input io.ByteReader) error {
+func (d *DeltaStruct) digestReader(input io.Reader) error {
 	blockLenu64 := uint64(d.sig.BlockLen)
+	buf := make([]byte, d.sig.BlockLen)
+
 	for {
-		in, err := input.ReadByte()
-		if err == io.EOF {
+		var read_count uint64
+		if d.weakSum.count < uint64(d.sig.BlockLen) {
+			read_count = uint64(d.sig.BlockLen) - d.weakSum.count
+		} else {
+			read_count = 1
+		}
+
+		n, err := input.Read(buf[:read_count])
+		if n == 0 || err == io.EOF {
 			break
 		} else if err != nil {
 			return err
 		}
+		data := buf[:n]
 		if d.block.TotalWritten() > 0 {
 			d.prevByte, err = d.block.Get(0)
 			if err != nil {
 				return err
 			}
 		}
-		d.block.WriteByte(in)
-		d.weakSum.Rollin(in)
+		d.block.Write(data)
+		d.weakSum.Update(data)
 
 		if d.weakSum.count < blockLenu64 {
 			continue
