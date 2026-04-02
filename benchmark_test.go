@@ -22,8 +22,8 @@ func BenchmarkSignature1MB(b *testing.B) {
 	benchmarkSignature(b, 1_000_000)
 }
 
-func BenchmarkSignature1GB(b *testing.B) {
-	benchmarkSignature(b, 1_000_000_000)
+func BenchmarkSignature50MB(b *testing.B) {
+	benchmarkSignature(b, 50_000_000)
 }
 
 // Changes the final 10% of the input data.
@@ -54,8 +54,8 @@ func benchmarkDeltaChangeTail(b *testing.B, totalBytes int64) {
 	}
 }
 
-func BenchmarkDeltaChangeTail1GB(b *testing.B) {
-	benchmarkDeltaChangeTail(b, 1_000_000_000)
+func BenchmarkDeltaChangeTail50MB(b *testing.B) {
+	benchmarkDeltaChangeTail(b, 50_000_000)
 }
 
 func BenchmarkDeltaChangeTail1MB(b *testing.B) {
@@ -94,8 +94,8 @@ func benchmarkDeltaAppend(b *testing.B, totalBytes int64) {
 	}
 }
 
-func BenchmarkDeltaAppend1GB(b *testing.B) {
-	benchmarkDeltaAppend(b, 1_000_000_000)
+func BenchmarkDeltaAppend50MB(b *testing.B) {
+	benchmarkDeltaAppend(b, 50_000_000)
 }
 
 func BenchmarkDeltaAppend1MB(b *testing.B) {
@@ -129,8 +129,8 @@ func benchmarkDeltaPrepend(b *testing.B, totalBytes int64) {
 	}
 }
 
-func BenchmarkDeltaPrepend1GB(b *testing.B) {
-	benchmarkDeltaPrepend(b, 1_000_000_000)
+func BenchmarkDeltaPrepend50MB(b *testing.B) {
+	benchmarkDeltaPrepend(b, 50_000_000)
 }
 
 func BenchmarkDeltaPrepend1MB(b *testing.B) {
@@ -171,8 +171,8 @@ func benchmarkDeltaInpend(b *testing.B, totalBytes int64) {
 	}
 }
 
-func BenchmarkDeltaInpend1GB(b *testing.B) {
-	benchmarkDeltaInpend(b, 1_000_000_000)
+func BenchmarkDeltaInpend50MB(b *testing.B) {
+	benchmarkDeltaInpend(b, 50_000_000)
 }
 
 func BenchmarkDeltaInpend1MB(b *testing.B) {
@@ -208,8 +208,8 @@ func benchmarkDeltaCutTail(b *testing.B, totalBytes int64) {
 	}
 }
 
-func BenchmarkDeltaCutTail1GB(b *testing.B) {
-	benchmarkDeltaCutTail(b, 1_000_000_000)
+func BenchmarkDeltaCutTail50MB(b *testing.B) {
+	benchmarkDeltaCutTail(b, 50_000_000)
 }
 
 func BenchmarkDeltaCutTail1MB(b *testing.B) {
@@ -249,8 +249,8 @@ func benchmarkDeltaCutHead(b *testing.B, totalBytes int64) {
 	}
 }
 
-func BenchmarkDeltaCutHead1GB(b *testing.B) {
-	benchmarkDeltaCutHead(b, 1_000_000_000)
+func BenchmarkDeltaCutHead50MB(b *testing.B) {
+	benchmarkDeltaCutHead(b, 50_000_000)
 }
 
 func BenchmarkDeltaCutHead1MB(b *testing.B) {
