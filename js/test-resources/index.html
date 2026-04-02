@@ -1,0 +1,18 @@
+<html>
+    <script src="./wasm_exec.js"></script>
+    <script>
+        const go = new Go()
+        WebAssembly.instantiateStreaming(fetch('./lib.wasm'), go.importObject).then(result => {
+            go.run(result.instance)
+        })
+    </script>
+    <script type="module">
+        import { Signature, Delta } from './lib.js'
+        window.Signature = Signature
+        window.Delta = Delta
+    </script>
+    <body>
+        <div id="dummy"></div>
+        <input id="upload" type="file">
+    </body>
+</html>

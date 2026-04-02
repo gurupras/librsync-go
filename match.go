@@ -19,11 +19,12 @@ const (
 var OUTPUT_BUFFER_SIZE = uint64(16 * 1024 * 1024)
 
 type match struct {
-	kind   matchKind
-	pos    uint64
-	len    uint64
-	output io.Writer
-	lit    []byte
+	kind             matchKind
+	pos              uint64
+	len              uint64
+	output           io.Writer
+	lit              []byte
+	outputBufferSize uint64
 }
 
 func intSize(d uint64) uint8 {
@@ -41,8 +42,9 @@ func intSize(d uint64) uint8 {
 
 func newMatch(output io.Writer, buff []byte) match {
 	return match{
-		output: output,
-		lit:    buff,
+		output:           output,
+		lit:              buff,
+		outputBufferSize: uint64(cap(buff)),
 	}
 }
 
@@ -135,6 +137,24 @@ func (m *match) flush() error {
 	return nil
 }
 
+func (m *match) addLiteralBytes(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if m.len != 0 && m.kind != MATCH_KIND_LITERAL {
+		if err := m.flush(); err != nil {
+			return err
+		}
+	}
+	m.kind = MATCH_KIND_LITERAL
+	m.lit = append(m.lit, data...)
+	m.len += uint64(len(data))
+	if m.len >= m.outputBufferSize {
+		return m.flush()
+	}
+	return nil
+}
+
 func (m *match) add(kind matchKind, pos, len uint64) error {
 	if len != 0 && m.kind != kind {
 		err := m.flush()
@@ -149,7 +169,7 @@ func (m *match) add(kind matchKind, pos, len uint64) error {
 	case MATCH_KIND_LITERAL:
 		m.lit = append(m.lit, byte(pos))
 		m.len += 1
-		if m.len >= OUTPUT_BUFFER_SIZE {
+		if m.len >= m.outputBufferSize {
 			err := m.flush()
 			if err != nil {
 				return err

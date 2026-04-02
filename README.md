@@ -12,6 +12,36 @@ go install github.com/balena-os/librsync-go/cmd/rdiff
 
 To use it as a library simply include `github.com/balena-os/librsync-go` in your import statement
 
+## Benchmarks
+
+To run the benchmarks:
+
+```sh
+go test -bench=. -benchtime=5x -count=6 .
+```
+
+To compare before and after a change, save results to files and use
+[benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+
+```sh
+# on the baseline
+go test -bench=. -benchtime=5x -count=6 . > old.txt
+
+# after your change
+go test -bench=. -benchtime=5x -count=6 . > new.txt
+
+benchstat old.txt new.txt
+```
+
+Install `benchstat` if needed:
+
+```sh
+go install golang.org/x/perf/cmd/benchstat@latest
+```
+
+The benchmark suite covers signature generation and delta computation
+(change tail/head, append, prepend, insert, cut) at 1MB and 50MB scales.
+
 ## Contributing
 
 If you're interested in contributing, that's awesome!
