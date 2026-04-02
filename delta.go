@@ -17,51 +17,46 @@ type DeltaStruct struct {
 	weakSum  *Rollsum
 	block    circbuf.Buffer
 	output   io.Writer
+	buf      []byte
 }
 
 func (d *DeltaStruct) Digest(b []byte) error {
-	buf := bytes.NewBuffer(b)
-	return d.digestReader(buf)
+	return d.digestReader(bytes.NewReader(b))
 }
 
 func (d *DeltaStruct) digestReader(input io.Reader) error {
 	blockLenu64 := uint64(d.sig.BlockLen)
-	buf := make([]byte, d.sig.BlockLen)
+	buf := d.buf
 
 	for {
-		var read_count uint64
-		if d.weakSum.count < uint64(d.sig.BlockLen) {
-			read_count = uint64(d.sig.BlockLen) - d.weakSum.count
-		} else {
-			read_count = 1
-		}
-
-		n, err := input.Read(buf[:read_count])
-		if n == 0 || err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-		data := buf[:n]
-		if d.block.TotalWritten() > 0 {
-			d.prevByte, err = d.block.Get(0)
-			if err != nil {
-				return err
-			}
-		}
-		d.block.Write(data)
-		d.weakSum.Update(data)
-
 		if d.weakSum.count < blockLenu64 {
-			continue
-		}
-
-		if d.weakSum.count > blockLenu64 {
-			err := d.match.add(MATCH_KIND_LITERAL, uint64(d.prevByte), 1)
-			if err != nil {
+			// Fill phase: read as many bytes as needed to complete the block.
+			n, err := input.Read(buf[:blockLenu64-d.weakSum.count])
+			if n == 0 || err == io.EOF {
+				break
+			} else if err != nil {
 				return err
 			}
-			d.weakSum.Rollout(d.prevByte)
+			d.block.Write(buf[:n])
+			d.weakSum.Update(buf[:n])
+			if d.weakSum.count < blockLenu64 {
+				continue
+			}
+		} else {
+			// Slide phase: advance the window by one byte using Rotate.
+			n, err := input.Read(buf[:1])
+			if n == 0 || err == io.EOF {
+				break
+			} else if err != nil {
+				return err
+			}
+			in := buf[0]
+			d.prevByte, _ = d.block.Get(0)
+			d.block.Write(buf[:1])
+			if err := d.match.add(MATCH_KIND_LITERAL, uint64(d.prevByte), 1); err != nil {
+				return err
+			}
+			d.weakSum.Rotate(d.prevByte, in)
 		}
 
 		if blockIdx, ok := d.sig.Weak2block[d.weakSum.Digest()]; ok {
@@ -69,8 +64,7 @@ func (d *DeltaStruct) digestReader(input io.Reader) error {
 			if bytes.Equal(d.sig.StrongSigs[blockIdx], strong2) {
 				d.weakSum.Reset()
 				d.block.Reset()
-				err := d.match.add(MATCH_KIND_COPY, uint64(blockIdx)*blockLenu64, blockLenu64)
-				if err != nil {
+				if err := d.match.add(MATCH_KIND_COPY, uint64(blockIdx)*blockLenu64, blockLenu64); err != nil {
 					return err
 				}
 			}
@@ -80,11 +74,8 @@ func (d *DeltaStruct) digestReader(input io.Reader) error {
 }
 
 func (d *DeltaStruct) End() error {
-	for _, b := range d.block.Bytes() {
-		err := d.match.add(MATCH_KIND_LITERAL, uint64(b), 1)
-		if err != nil {
-			return err
-		}
+	if err := d.match.addLiteralBytes(d.block.Bytes()); err != nil {
+		return err
 	}
 
 	if err := d.match.flush(); err != nil {
@@ -117,6 +108,7 @@ func newDeltaWithLitBuf(sig *SignatureType, output io.Writer, litBuff []byte) (*
 		weakSum:  &weakSum,
 		block:    block,
 		output:   output,
+		buf:      make([]byte, sig.BlockLen),
 	}
 
 	err := binary.Write(output, binary.BigEndian, DELTA_MAGIC)

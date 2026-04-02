@@ -137,6 +137,24 @@ func (m *match) flush() error {
 	return nil
 }
 
+func (m *match) addLiteralBytes(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if m.len != 0 && m.kind != MATCH_KIND_LITERAL {
+		if err := m.flush(); err != nil {
+			return err
+		}
+	}
+	m.kind = MATCH_KIND_LITERAL
+	m.lit = append(m.lit, data...)
+	m.len += uint64(len(data))
+	if m.len >= m.outputBufferSize {
+		return m.flush()
+	}
+	return nil
+}
+
 func (m *match) add(kind matchKind, pos, len uint64) error {
 	if len != 0 && m.kind != kind {
 		err := m.flush()
