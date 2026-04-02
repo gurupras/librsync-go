@@ -9,8 +9,6 @@ import (
 	"github.com/balena-os/librsync-go"
 )
 
-var delta *librsync.DeltaStruct
-
 func NewDelta(this js.Value, args []js.Value) interface{} {
 	sigMap := convertToObject(args[0])
 	bufSize := args[1].Int()
@@ -38,8 +36,7 @@ func NewDelta(this js.Value, args []js.Value) interface{} {
 	}
 
 	output := bytes.NewBuffer(nil)
-	var err error
-	delta, err = librsync.NewDelta(signatureType, output, bufSize)
+	delta, err := librsync.NewDelta(signatureType, output, bufSize)
 	if err != nil {
 		return []interface{}{nil, err.Error()}
 	}

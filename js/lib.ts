@@ -42,7 +42,6 @@ export class Delta {
   private _delta: librsync.Delta
 
   constructor (sig: SignatureType, literalBufSize: number) {
-    console.log(`Size of sig.weak2block: ${sig.weak2block.size}`)
     this._delta = new librsync.Delta(sig, literalBufSize)
   }
 
