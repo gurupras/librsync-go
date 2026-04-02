@@ -29,6 +29,7 @@ type signature struct {
 	maxStrongLen uint32
 	block        []byte
 	output       io.Writer
+	strongBuf    []byte
 }
 
 func NewSignature(sigType MagicNumber, blockLen, strongLen uint32, output io.Writer) (*signature, error) {
@@ -58,6 +59,7 @@ func NewSignature(sigType MagicNumber, blockLen, strongLen uint32, output io.Wri
 		maxStrongLen: maxStrongLen,
 		block:        make([]byte, blockLen),
 		output:       output,
+		strongBuf:    make([]byte, maxStrongLen),
 	}
 
 	err := binary.Write(output, binary.BigEndian, sigType)
@@ -77,8 +79,7 @@ func NewSignature(sigType MagicNumber, blockLen, strongLen uint32, output io.Wri
 }
 
 func (s *signature) Digest(b []byte) error {
-	buf := bytes.NewBuffer(b)
-	return s.DigestReader(buf)
+	return s.DigestReader(bytes.NewReader(b))
 }
 
 func (s *signature) DigestReader(reader io.Reader) error {
@@ -107,9 +108,11 @@ func (s *signature) DigestReader(reader io.Reader) error {
 			return err
 		}
 
-		strong, _ := CalcStrongSum(data, s.SigType, s.StrongLen)
-		s.output.Write(strong)
+		CalcStrongSumInto(s.strongBuf, data, s.SigType)
+		s.output.Write(s.strongBuf[:s.StrongLen])
 
+		strong := make([]byte, s.StrongLen)
+		copy(strong, s.strongBuf[:s.StrongLen])
 		s.Weak2block[weak] = len(s.StrongSigs)
 		s.StrongSigs = append(s.StrongSigs, strong)
 	}
@@ -131,6 +134,21 @@ func CalcStrongSum(data []byte, sigType MagicNumber, strongLen uint32) ([]byte, 
 		return d.Sum(nil)[:strongLen], nil
 	}
 	return nil, fmt.Errorf("invalid sigType %#x", sigType)
+}
+
+// CalcStrongSumInto writes the strong checksum into dst, which must be at
+// least maxStrongLen bytes for the given sigType. It avoids the heap
+// allocation that CalcStrongSum incurs from slicing a local array.
+func CalcStrongSumInto(dst []byte, data []byte, sigType MagicNumber) {
+	switch sigType {
+	case BLAKE2_SIG_MAGIC:
+		d := blake2b.Sum256(data)
+		copy(dst, d[:])
+	case MD4_SIG_MAGIC:
+		d := md4.New()
+		d.Write(data)
+		copy(dst, d.Sum(nil))
+	}
 }
 
 func Signature(input io.Reader, output io.Writer, blockLen, strongLen uint32, sigType MagicNumber) (*SignatureType, error) {
