@@ -30,6 +30,7 @@ type signature struct {
 	block        []byte
 	output       io.Writer
 	strongBuf    []byte
+	outBuf       [4 + BLAKE2_SUM_LENGTH]byte // pre-allocated buffer for combined weak+strong write
 }
 
 func NewSignature(sigType MagicNumber, blockLen, strongLen uint32, output io.Writer) (*signature, error) {
@@ -103,13 +104,13 @@ func (s *signature) DigestReader(reader io.Reader) error {
 		data := s.block[:n]
 
 		weak := WeakChecksum(data)
-		err = binary.Write(s.output, binary.BigEndian, weak)
-		if err != nil {
+		CalcStrongSumInto(s.strongBuf, data, s.SigType)
+
+		binary.BigEndian.PutUint32(s.outBuf[:4], weak)
+		copy(s.outBuf[4:], s.strongBuf[:s.StrongLen])
+		if _, err := s.output.Write(s.outBuf[:4+s.StrongLen]); err != nil {
 			return err
 		}
-
-		CalcStrongSumInto(s.strongBuf, data, s.SigType)
-		s.output.Write(s.strongBuf[:s.StrongLen])
 
 		strong := make([]byte, s.StrongLen)
 		copy(strong, s.strongBuf[:s.StrongLen])
@@ -187,20 +188,18 @@ func ReadSignature(r io.Reader) (*SignatureType, error) {
 	strongSigs := [][]byte{}
 	weak2block := map[uint32]int{}
 
+	entryBuf := make([]byte, 4+int(strongLen))
 	for {
-		var weakSum uint32
-		err = binary.Read(r, binary.BigEndian, &weakSum)
+		_, err := io.ReadFull(r, entryBuf)
 		if err == io.EOF {
 			break
 		} else if err != nil {
 			return nil, err
 		}
 
+		weakSum := binary.BigEndian.Uint32(entryBuf[:4])
 		strongSum := make([]byte, strongLen)
-		_, err := io.ReadFull(r, strongSum)
-		if err != nil {
-			return nil, err
-		}
+		copy(strongSum, entryBuf[4:])
 
 		weak2block[weakSum] = len(strongSigs)
 		strongSigs = append(strongSigs, strongSum)

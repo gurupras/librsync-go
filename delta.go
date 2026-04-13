@@ -21,10 +21,10 @@ type DeltaStruct struct {
 }
 
 func (d *DeltaStruct) Digest(b []byte) error {
-	return d.digestReader(bytes.NewReader(b))
+	return d.digestReader(bufio.NewReader(bytes.NewReader(b)))
 }
 
-func (d *DeltaStruct) digestReader(input io.Reader) error {
+func (d *DeltaStruct) digestReader(input *bufio.Reader) error {
 	blockLenu64 := uint64(d.sig.BlockLen)
 	buf := d.buf
 
@@ -44,15 +44,14 @@ func (d *DeltaStruct) digestReader(input io.Reader) error {
 			}
 		} else {
 			// Slide phase: advance the window by one byte using Rotate.
-			n, err := input.Read(buf[:1])
-			if n == 0 || err == io.EOF {
+			in, err := input.ReadByte()
+			if err == io.EOF {
 				break
 			} else if err != nil {
 				return err
 			}
-			in := buf[0]
 			d.prevByte, _ = d.block.Get(0)
-			d.block.Write(buf[:1])
+			d.block.WriteByte(in)
 			if err := d.match.add(MATCH_KIND_LITERAL, uint64(d.prevByte), 1); err != nil {
 				return err
 			}
