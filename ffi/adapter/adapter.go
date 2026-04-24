@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 
@@ -225,43 +226,183 @@ func (s *DeltaSession) End() ([]byte, error) {
 
 // ── Streaming Patch ───────────────────────────────────────────────────────────
 
-// PatchSession buffers delta chunks and applies them against a callback-based
-// base file when End is called. The base is accessed via random reads and does
-// not need to be fully loaded into memory.
+// errPatchEnded is the sticky sentinel stored in PatchSession.err after a
+// successful End so that repeated End calls return (nil, nil) rather than
+// re-running or blocking.
+var errPatchEnded = errors.New("librsync: patch session ended")
+
+// chanWriter relays Patch output chunks to the caller via a buffered channel.
+// Each Write call copies its bytes so the Patch goroutine's stack is not held.
+// The quit channel is closed by Close() to unblock a stuck Write when the
+// caller abandons the session without calling End.
+type chanWriter struct {
+	ch   chan []byte
+	quit <-chan struct{}
+}
+
+func (w *chanWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	chunk := make([]byte, len(p))
+	copy(chunk, p)
+	select {
+	case w.ch <- chunk:
+		return len(p), nil
+	case <-w.quit:
+		return 0, errors.New("librsync: patch session closed")
+	}
+}
+
+// PatchSession streams a patch operation with bounded memory usage.
+//
+// Delta bytes are fed in arbitrary chunks via Feed; each call returns whatever
+// output the Patch goroutine has produced so far (may be nil). End signals
+// end-of-delta and returns all remaining output.
+//
+// Internally, librsync.Patch runs in a goroutine connected to the caller by
+// two io.Pipe channels so that neither the delta stream nor the output is ever
+// fully buffered in memory:
+//
+//   - Delta input:  io.Pipe — zero internal buffer; bytes pass straight to Patch.
+//   - Output:       buffered channel of ≤32 KB chunks — at most ~1 MB in flight.
+//   - Base file:    accessed via ReadAtFunc — never loaded into memory.
 //
 // The ReadAtFunc and any resources it references must remain valid until End or
 // Close returns.
 type PatchSession struct {
-	base     *callbackReadSeeker
-	deltaBuf bytes.Buffer
-	err      error
+	deltaW *io.PipeWriter
+	outCh  chan []byte
+	errCh  chan error
+	quit   chan struct{}
+	err    error // sticky: set on first error or successful End
 }
 
 func NewPatchSession(readAt ReadAtFunc) *PatchSession {
-	return &PatchSession{base: &callbackReadSeeker{readAt: readAt}}
-}
+	deltaR, deltaW := io.Pipe()
+	outCh := make(chan []byte, 32) // ~1 MB max in-flight at 32 KB/chunk
+	errCh := make(chan error, 1)
+	quit := make(chan struct{})
 
-// Feed buffers a chunk of the delta stream. Once Feed returns an error, the
-// session is valid only for abandonment.
-func (s *PatchSession) Feed(delta []byte) error {
-	if s.err != nil {
-		return s.err
+	go func() {
+		base := &callbackReadSeeker{readAt: readAt}
+		err := librsync.Patch(base, deltaR, &chanWriter{ch: outCh, quit: quit})
+		// CloseWithError wakes any blocked deltaW.Write and returns that error
+		// to the writer goroutine spawned in Feed, preventing a goroutine leak.
+		if err != nil {
+			deltaR.CloseWithError(err)
+		} else {
+			deltaR.Close()
+		}
+		close(outCh)
+		errCh <- err
+	}()
+
+	return &PatchSession{
+		deltaW: deltaW,
+		outCh:  outCh,
+		errCh:  errCh,
+		quit:   quit,
 	}
-	_, err := s.deltaBuf.Write(delta)
-	return err
 }
 
-// End applies the buffered delta to the base file and invalidates the session.
-func (s *PatchSession) End() ([]byte, error) {
+// Feed sends a delta chunk to the Patch goroutine and returns whatever output
+// has been produced so far. The returned slice may be nil if no output is
+// ready yet — all output is guaranteed to be flushed by End.
+//
+// Feed writes the delta to the pipe in a goroutine and simultaneously drains
+// available output. This prevents deadlock: if the output channel is full,
+// draining it unblocks the Patch goroutine so it can consume more delta.
+//
+// Once Feed returns an error the session is valid only for Close.
+func (s *PatchSession) Feed(delta []byte) ([]byte, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	var out bytes.Buffer
-	if err := librsync.Patch(s.base, &s.deltaBuf, &out); err != nil {
-		s.err = err
-		return nil, err
+	if len(delta) == 0 {
+		return nil, nil
 	}
-	return normalizeEmpty(out.Bytes()), nil
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := s.deltaW.Write(delta)
+		writeErr <- err
+	}()
+
+	var out []byte
+	for {
+		select {
+		case err := <-writeErr:
+			if err != nil {
+				s.err = err
+				return out, err
+			}
+			// Write consumed; non-blocking drain of any queued output.
+			for {
+				select {
+				case chunk, ok := <-s.outCh:
+					if !ok {
+						// Patch already returned; error (if any) surfaces in End.
+						return out, nil
+					}
+					out = append(out, chunk...)
+				default:
+					return out, nil
+				}
+			}
+		case chunk, ok := <-s.outCh:
+			if !ok {
+				// outCh closed: Patch returned before Write finished.
+				// Nil the field so future select iterations don't spin on it;
+				// writeErr will arrive momentarily.
+				s.outCh = nil
+			} else {
+				out = append(out, chunk...)
+			}
+		}
+	}
+}
+
+// End signals end-of-delta and returns all remaining output.
+// Always invalidates the session — do not call Feed or End again after this.
+// Calling End on an already-ended session is a no-op that returns (nil, nil).
+func (s *PatchSession) End() ([]byte, error) {
+	if s.err != nil {
+		if s.err == errPatchEnded {
+			return nil, nil
+		}
+		return nil, s.err
+	}
+	s.deltaW.Close() // signal EOF to Patch goroutine
+	var out []byte
+	for s.outCh != nil {
+		chunk, ok := <-s.outCh
+		if !ok {
+			break
+		}
+		out = append(out, chunk...)
+	}
+	err := <-s.errCh
+	if err != nil {
+		s.err = err
+	} else {
+		s.err = errPatchEnded
+	}
+	return normalizeEmpty(out), err
+}
+
+// Close abandons the session without finalizing. Use on the error path when
+// End has not been called. After Close, the session must not be used again.
+func (s *PatchSession) Close() {
+	if s.err != nil {
+		return // goroutine already exited (error path) or End was called
+	}
+	s.err = errPatchEnded
+	close(s.quit)                                             // unblock chanWriter if stuck on full outCh
+	s.deltaW.CloseWithError(errors.New("librsync: abandoned")) // unblock Patch goroutine if stuck on Read
+	for range s.outCh {                                        // drain so chanWriter can exit
+	}
+	<-s.errCh // wait for goroutine to fully exit
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
