@@ -85,10 +85,11 @@ func readFile(t *testing.T, path string) []byte {
 	return data
 }
 
-// collectChunks concatenates streaming output chunks into a single slice,
-// ignoring nil chunks (no-output feeds).
+// collectChunks concatenates streaming output chunks into a single slice.
+// Returns []byte{} rather than nil so comparisons against os.ReadFile output
+// on empty files behave correctly.
 func collectChunks(chunks [][]byte) []byte {
-	var out []byte
+	out := []byte{}
 	for _, c := range chunks {
 		out = append(out, c...)
 	}
@@ -332,7 +333,8 @@ func TestStreamingDeltaMatchesBatch(t *testing.T) {
 
 // TestStreamingPatchWithCallback verifies that PatchSession correctly
 // reconstructs the new file when the delta is fed in chunks and the base
-// file is accessed via a callback.
+// file is accessed via a callback. Output chunks returned by Feed are
+// collected alongside the final output from End.
 func TestStreamingPatchWithCallback(t *testing.T) {
 	for _, tt := range allTestCases {
 		t.Run(tt, func(t *testing.T) {
@@ -351,20 +353,210 @@ func TestStreamingPatchWithCallback(t *testing.T) {
 
 			sess := adapter.NewPatchSession(makeReadAt(oldData))
 
-			chunkSize := 256
-			for i := 0; i < len(deltaBytes); i += chunkSize {
-				end := i + chunkSize
-				if end > len(deltaBytes) {
-					end = len(deltaBytes)
-				}
-				require.NoError(t, sess.Feed(deltaBytes[i:end]))
+			chunks := streamFeed(t, deltaBytes, 256, sess.Feed)
+
+			final, err := sess.End()
+			require.NoError(t, err)
+			if len(final) > 0 {
+				chunks = append(chunks, final)
 			}
 
-			got, err := sess.End()
-			require.NoError(t, err)
-			require.Equal(t, newData, got)
+			require.Equal(t, newData, collectChunks(chunks))
 		})
 	}
+}
+
+// TestStreamingPatchOutputIsIncremental verifies that Feed returns output
+// before End is called, i.e. that the patch goroutine is truly streaming and
+// not deferring everything to End. We use a file large enough that at least
+// one op produces output during the feed phase.
+func TestStreamingPatchOutputIsIncremental(t *testing.T) {
+	// Use a mid-size test case guaranteed to have non-trivial content.
+	tt := "005-blake2-512-32"
+	file, magic, blockLen, strongLen, err := parseTestName(tt)
+	require.NoError(t, err)
+
+	oldData := readFile(t, testdataDir+file+".old")
+	newData := readFile(t, testdataDir+file+".new")
+
+	sigBytes, err := adapter.SignatureBytes(oldData, blockLen, strongLen, magic)
+	require.NoError(t, err)
+	sig, err := adapter.ParseSignature(sigBytes)
+	require.NoError(t, err)
+	deltaBytes, err := adapter.DeltaBytes(sig, newData)
+	require.NoError(t, err)
+
+	sess := adapter.NewPatchSession(makeReadAt(oldData))
+
+	var feedOutput []byte
+	chunks := streamFeed(t, deltaBytes, 64, func(b []byte) ([]byte, error) {
+		out, err := sess.Feed(b)
+		feedOutput = append(feedOutput, out...)
+		return out, err
+	})
+	_ = chunks
+
+	final, err := sess.End()
+	require.NoError(t, err)
+
+	// At least some output must have arrived during Feed, not only in End.
+	require.NotEmpty(t, feedOutput, "expected incremental output from Feed calls, got none")
+
+	// Full result must still be correct.
+	all := append(feedOutput, final...)
+	require.Equal(t, newData, all)
+}
+
+// TestStreamingPatchMatchesBatch confirms that streaming patch output,
+// concatenated across all Feed and End calls, is byte-for-byte identical to
+// PatchBytes output regardless of chunk size. This is the patch analogue of
+// TestStreamingDeltaMatchesBatch and validates correctness across all chunking
+// patterns.
+func TestStreamingPatchMatchesBatch(t *testing.T) {
+	for _, tt := range allTestCases {
+		file, magic, blockLen, strongLen, err := parseTestName(tt)
+		require.NoError(t, err)
+
+		oldData := readFile(t, testdataDir+file+".old")
+		newData := readFile(t, testdataDir+file+".new")
+
+		sigBytes, err := adapter.SignatureBytes(oldData, blockLen, strongLen, magic)
+		require.NoError(t, err)
+		sig, err := adapter.ParseSignature(sigBytes)
+		require.NoError(t, err)
+		deltaBytes, err := adapter.DeltaBytes(sig, newData)
+		require.NoError(t, err)
+
+		want, err := adapter.PatchBytes(oldData, deltaBytes)
+		require.NoError(t, err)
+
+		for _, chunkSize := range streamingChunkSizes {
+			t.Run(fmt.Sprintf("%s/chunk%d", tt, chunkSize), func(t *testing.T) {
+				sess := adapter.NewPatchSession(makeReadAt(oldData))
+				chunks := streamFeed(t, deltaBytes, chunkSize, sess.Feed)
+				final, err := sess.End()
+				require.NoError(t, err)
+				if len(final) > 0 {
+					chunks = append(chunks, final)
+				}
+				require.Equal(t, want, collectChunks(chunks))
+			})
+		}
+	}
+}
+
+// TestStreamingPatchEmptyChunks verifies that feeding nil and zero-length
+// chunks to a PatchSession is a safe no-op that does not corrupt the output.
+func TestStreamingPatchEmptyChunks(t *testing.T) {
+	tt := "001-blake2-512-32"
+	file, magic, blockLen, strongLen, err := parseTestName(tt)
+	require.NoError(t, err)
+
+	oldData := readFile(t, testdataDir+file+".old")
+	newData := readFile(t, testdataDir+file+".new")
+
+	sigBytes, err := adapter.SignatureBytes(oldData, blockLen, strongLen, magic)
+	require.NoError(t, err)
+	sig, err := adapter.ParseSignature(sigBytes)
+	require.NoError(t, err)
+
+	sig2, err := adapter.ParseSignature(sigBytes)
+	require.NoError(t, err)
+	deltaBytes, err := adapter.DeltaBytes(sig, newData)
+	require.NoError(t, err)
+
+	want, err := adapter.PatchBytes(oldData, deltaBytes)
+	require.NoError(t, err)
+
+	_ = sig2
+	sess := adapter.NewPatchSession(makeReadAt(oldData))
+
+	// Intersperse nil and empty feeds before and after real data.
+	out, err := sess.Feed(nil)
+	require.NoError(t, err)
+	require.Nil(t, out)
+
+	out, err = sess.Feed([]byte{})
+	require.NoError(t, err)
+	require.Nil(t, out)
+
+	chunks := streamFeed(t, deltaBytes, 512, sess.Feed)
+
+	out, err = sess.Feed(nil)
+	require.NoError(t, err)
+	require.Nil(t, out)
+
+	final, err := sess.End()
+	require.NoError(t, err)
+	if len(final) > 0 {
+		chunks = append(chunks, final)
+	}
+
+	require.Equal(t, want, collectChunks(chunks))
+}
+
+// TestStreamingPatchCloseAbandon verifies that Close() on an in-progress
+// session cleans up the Patch goroutine without blocking indefinitely or
+// panicking, even when the session has never been fed any data. This guards
+// against goroutine leaks on the error/abandon path.
+func TestStreamingPatchCloseAbandon(t *testing.T) {
+	tt := "003-blake2-512-32"
+	file, magic, blockLen, strongLen, err := parseTestName(tt)
+	require.NoError(t, err)
+
+	oldData := readFile(t, testdataDir+file+".old")
+	newData := readFile(t, testdataDir+file+".new")
+
+	sigBytes, err := adapter.SignatureBytes(oldData, blockLen, strongLen, magic)
+	require.NoError(t, err)
+	sig, err := adapter.ParseSignature(sigBytes)
+	require.NoError(t, err)
+	deltaBytes, err := adapter.DeltaBytes(sig, newData)
+	require.NoError(t, err)
+
+	t.Run("close_before_any_feed", func(t *testing.T) {
+		sess := adapter.NewPatchSession(makeReadAt(oldData))
+		sess.Close() // must not block or panic
+	})
+
+	t.Run("close_after_partial_feed", func(t *testing.T) {
+		sess := adapter.NewPatchSession(makeReadAt(oldData))
+		// Feed half the delta then abandon.
+		half := deltaBytes[:len(deltaBytes)/2]
+		_, err := sess.Feed(half)
+		require.NoError(t, err)
+		sess.Close() // must not block or panic
+	})
+
+	t.Run("close_after_end", func(t *testing.T) {
+		sess := adapter.NewPatchSession(makeReadAt(oldData))
+		chunks := streamFeed(t, deltaBytes, 512, sess.Feed)
+		final, err := sess.End()
+		require.NoError(t, err)
+		if len(final) > 0 {
+			chunks = append(chunks, final)
+		}
+		require.Equal(t, newData, collectChunks(chunks))
+
+		// Close after a successful End must be a silent no-op.
+		sess.Close()
+		sess.Close() // idempotent
+	})
+}
+
+// TestStreamingPatchCloseAfterError verifies that Close() is a no-op when
+// the session has already terminated due to an error, and that no goroutine
+// is leaked in that scenario.
+func TestStreamingPatchCloseAfterError(t *testing.T) {
+	readAt := makeReadAt([]byte("base file contents"))
+	sess := adapter.NewPatchSession(readAt)
+
+	_, _ = sess.Feed([]byte("not a valid delta"))
+	_, _ = sess.End() // surface the error
+
+	// Both of these must return immediately without blocking.
+	sess.Close()
+	sess.Close()
 }
 
 // ── Full streaming round-trip ─────────────────────────────────────────────────
@@ -409,17 +601,14 @@ func TestFullStreamingRoundTrip(t *testing.T) {
 
 			// 3. Streaming patch using callback for old file.
 			patchSess := adapter.NewPatchSession(makeReadAt(oldData))
-			for i := 0; i < len(deltaBytes); i += chunkSize {
-				end := i + chunkSize
-				if end > len(deltaBytes) {
-					end = len(deltaBytes)
-				}
-				require.NoError(t, patchSess.Feed(deltaBytes[i:end]))
-			}
-			got, err := patchSess.End()
+			patchChunks := streamFeed(t, deltaBytes, chunkSize, patchSess.Feed)
+			final, err = patchSess.End()
 			require.NoError(t, err)
+			if len(final) > 0 {
+				patchChunks = append(patchChunks, final)
+			}
 
-			require.Equal(t, newData, got)
+			require.Equal(t, newData, collectChunks(patchChunks))
 		})
 	}
 }
@@ -506,21 +695,33 @@ func TestBatchSignatureMatchesStreaming(t *testing.T) {
 }
 
 // TestDeltaFeedErrorStopsSession verifies the feed-after-error lifecycle
-// contract: once a session's End returns an error, subsequent calls return
-// the same error rather than proceeding.
+// contract: a corrupt delta causes an error in Feed or End (timing-dependent),
+// and once the error is observed, every subsequent End call returns the same
+// error rather than panicking or producing output.
 func TestDeltaFeedErrorStopsSession(t *testing.T) {
-	// Provide a corrupt delta to PatchSession to trigger an error on End.
 	readAt := makeReadAt([]byte("base file contents"))
 	sess := adapter.NewPatchSession(readAt)
-	require.NoError(t, sess.Feed([]byte("not a valid delta")))
 
-	_, err := sess.End()
-	require.Error(t, err)
+	// Corrupt delta: error may surface in Feed (if Patch errors before the
+	// Write completes) or deferred to End. Both are valid.
+	_, feedErr := sess.Feed([]byte("not a valid delta"))
+
+	_, endErr := sess.End()
+
+	// At least one of feedErr or endErr must be non-nil.
+	if feedErr != nil {
+		// Error surfaced in Feed; End must return the same sticky error.
+		require.Equal(t, feedErr, endErr)
+	} else {
+		require.Error(t, endErr)
+	}
 
 	// Calling End again must return an error, not panic or produce output.
 	_, err2 := sess.End()
 	require.Error(t, err2)
-	require.Equal(t, err, err2, "repeated End must return the same error")
+	if endErr != nil {
+		require.Equal(t, endErr, err2, "repeated End must return the same error")
+	}
 }
 
 // TestStreamingDeltaEmptyChunks verifies that feeding zero-length chunks to a
