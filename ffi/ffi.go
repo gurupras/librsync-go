@@ -364,21 +364,27 @@ func librsync_patch_new(rs *C.rs_read_seeker_t) C.intptr_t {
 	return storeHandle(sess)
 }
 
-// librsync_patch_feed buffers a chunk of the delta stream.
+// librsync_patch_feed sends a chunk of the delta stream to the Patch goroutine
+// and returns whatever output has been produced so far. *out_ptr/*out_len may
+// be NULL/0 if no output is ready yet — all output is guaranteed to be flushed
+// by librsync_patch_end. Caller must librsync_free(*out_ptr) if *out_len > 0.
 // On error the handle is valid only for librsync_patch_free.
 //
 //export librsync_patch_feed
 func librsync_patch_feed(
 	handle C.intptr_t,
 	deltaPtr *C.uint8_t, deltaLen C.size_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
 ) C.int32_t {
 	sess, ok := loadHandle(handle).(*adapter.PatchSession)
 	if !ok {
 		return errArgs
 	}
-	if err := sess.Feed(cInput(deltaPtr, deltaLen)); err != nil {
+	result, err := sess.Feed(cInput(deltaPtr, deltaLen))
+	if err != nil {
 		return errCorrupt
 	}
+	setOutput(outPtr, outLen, result)
 	return errOK
 }
 
@@ -405,8 +411,14 @@ func librsync_patch_end(
 }
 
 // librsync_patch_free abandons the session without applying the patch.
+// Blocks briefly to drain the Patch goroutine cleanly — do not call from a
+// latency-sensitive thread.
 //
 //export librsync_patch_free
 func librsync_patch_free(handle C.intptr_t) {
+	sess, ok := loadHandle(handle).(*adapter.PatchSession)
 	dropHandle(handle)
+	if ok {
+		sess.Close()
+	}
 }
