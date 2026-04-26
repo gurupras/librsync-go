@@ -127,8 +127,17 @@ type SignatureSession struct {
 	out      *bytes.Buffer
 	pending  []byte
 	blockLen uint32
+	ended    bool // set by first EndInto call so the final flush only runs once
 	err      error
 }
+
+// errSigEnded / errDeltaEnded are sticky sentinels stored in .err once EndInto
+// has fully drained, so subsequent EndInto calls return (0, nil) instead of
+// re-running the (already idempotent) End logic.
+var (
+	errSigEnded   = errors.New("librsync: signature session ended")
+	errDeltaEnded = errors.New("librsync: delta session ended")
+)
 
 func NewSignatureSession(blockLen, strongLen uint32, sigType librsync.MagicNumber) (*SignatureSession, error) {
 	out := &bytes.Buffer{}
@@ -175,6 +184,63 @@ func (s *SignatureSession) End() ([]byte, error) {
 	return drainBuf(s.out), nil
 }
 
+// FeedInto is the zero-allocation variant of Feed: it digests input (which may
+// be empty as a pure drain request) and writes up to len(dst) bytes of output
+// directly into dst, returning the number of bytes written and a morePending
+// flag.
+//
+// morePending is true when output remains buffered internally — the caller
+// should drain by calling FeedInto again with empty input until it returns
+// morePending=false.
+func (s *SignatureSession) FeedInto(input, dst []byte) (n int, morePending bool, err error) {
+	if s.err != nil {
+		return 0, false, s.err
+	}
+	if len(input) > 0 {
+		s.pending = append(s.pending, input...)
+		complete := (len(s.pending) / int(s.blockLen)) * int(s.blockLen)
+		if complete > 0 {
+			if err := s.sig.Digest(s.pending[:complete]); err != nil {
+				s.err = err
+				return 0, false, err
+			}
+			s.pending = append(s.pending[:0], s.pending[complete:]...)
+		}
+	}
+	n = drainInto(s.out, dst)
+	return n, s.out.Len() > 0, nil
+}
+
+// EndInto is the zero-allocation variant of End. On the first call it flushes
+// the final partial block; subsequent calls drain remaining output in
+// dst-sized chunks. Returns the number of bytes written and a morePending
+// flag — drain by calling repeatedly until morePending=false.
+func (s *SignatureSession) EndInto(dst []byte) (n int, morePending bool, err error) {
+	if s.err != nil {
+		if s.err == errSigEnded {
+			return 0, false, nil
+		}
+		return 0, false, s.err
+	}
+	if !s.ended {
+		if len(s.pending) > 0 {
+			if err := s.sig.Digest(s.pending); err != nil {
+				s.err = err
+				return 0, false, err
+			}
+			s.pending = s.pending[:0]
+		}
+		s.sig.End()
+		s.ended = true
+	}
+	n = drainInto(s.out, dst)
+	morePending = s.out.Len() > 0
+	if !morePending {
+		s.err = errSigEnded
+	}
+	return n, morePending, nil
+}
+
 // ── Streaming Delta ───────────────────────────────────────────────────────────
 
 // DeltaSession streams delta bytes as input is fed in arbitrary-sized chunks.
@@ -186,6 +252,7 @@ func (s *SignatureSession) End() ([]byte, error) {
 type DeltaSession struct {
 	delta *librsync.DeltaStruct
 	out   *bytes.Buffer
+	ended bool // set by first EndInto call so delta.End() only runs once
 	err   error
 }
 
@@ -222,6 +289,49 @@ func (s *DeltaSession) End() ([]byte, error) {
 		return nil, err
 	}
 	return drainBuf(s.out), nil
+}
+
+// FeedInto is the zero-allocation variant of Feed: it digests input (which may
+// be empty as a pure drain request) and writes up to len(dst) bytes of output
+// directly into dst, returning the number of bytes written and a morePending
+// flag (true if output remains buffered internally; drain with empty input).
+func (s *DeltaSession) FeedInto(input, dst []byte) (n int, morePending bool, err error) {
+	if s.err != nil {
+		return 0, false, s.err
+	}
+	if len(input) > 0 {
+		if err := s.delta.Digest(input); err != nil {
+			s.err = err
+			return 0, false, err
+		}
+	}
+	n = drainInto(s.out, dst)
+	return n, s.out.Len() > 0, nil
+}
+
+// EndInto is the zero-allocation variant of End. Drains remaining output in
+// dst-sized chunks. Returns morePending=true while more output is buffered;
+// call repeatedly until morePending=false.
+func (s *DeltaSession) EndInto(dst []byte) (n int, morePending bool, err error) {
+	if s.err != nil {
+		if s.err == errDeltaEnded {
+			return 0, false, nil
+		}
+		return 0, false, s.err
+	}
+	if !s.ended {
+		if err := s.delta.End(); err != nil {
+			s.err = err
+			return 0, false, err
+		}
+		s.ended = true
+	}
+	n = drainInto(s.out, dst)
+	morePending = s.out.Len() > 0
+	if !morePending {
+		s.err = errDeltaEnded
+	}
+	return n, morePending, nil
 }
 
 // ── Streaming Patch ───────────────────────────────────────────────────────────
@@ -271,11 +381,13 @@ func (w *chanWriter) Write(p []byte) (int, error) {
 // The ReadAtFunc and any resources it references must remain valid until End or
 // Close returns.
 type PatchSession struct {
-	deltaW *io.PipeWriter
-	outCh  chan []byte
-	errCh  chan error
-	quit   chan struct{}
-	err    error // sticky: set on first error or successful End
+	deltaW   *io.PipeWriter
+	outCh    chan []byte
+	errCh    chan error
+	quit     chan struct{}
+	leftover []byte // chunk slice from outCh that didn't fit in the last dst
+	ended    bool   // set by first EndInto call so deltaW.Close() only runs once
+	err      error  // sticky: set on first error or successful End
 }
 
 func NewPatchSession(readAt ReadAtFunc) *PatchSession {
@@ -391,6 +503,183 @@ func (s *PatchSession) End() ([]byte, error) {
 	return normalizeEmpty(out), err
 }
 
+// FeedInto is the zero-allocation variant of Feed: it sends delta to the Patch
+// goroutine (delta may be empty as a pure drain request) and writes up to
+// len(dst) bytes of reconstructed output directly into dst, returning the
+// number of bytes written and a morePending flag.
+//
+// morePending is true when output is buffered internally (in leftover) — the
+// caller should drain by calling FeedInto again with empty input until it
+// returns morePending=false. Note: morePending only reports buffered output,
+// not output still pending in the channel; another Feed/End call may surface
+// more output even after morePending=false.
+func (s *PatchSession) FeedInto(delta, dst []byte) (n int, morePending bool, err error) {
+	if s.err != nil {
+		return 0, false, s.err
+	}
+	if len(dst) == 0 {
+		return 0, len(s.leftover) > 0, nil
+	}
+
+	// Fast path: serve from leftover if any, without touching the channel.
+	written := s.consumeLeftover(dst)
+	if written == len(dst) {
+		// dst is full; if delta is nil this is a pure drain request, otherwise
+		// we still need to send the delta. The caller will see a "full dst"
+		// return and call again with empty input — but if they passed delta
+		// here, dropping it would be wrong. Send it via the same goroutine
+		// dance Feed uses; sendDelta stashes any new output in s.leftover.
+		if len(delta) > 0 {
+			if _, err := s.sendDelta(delta, dst[:0]); err != nil {
+				return written, len(s.leftover) > 0, err
+			}
+		}
+		return written, len(s.leftover) > 0, nil
+	}
+
+	if len(delta) == 0 {
+		// Pure drain request: try to pull more from the channel without
+		// blocking on the producer (the producer hasn't been pushed by new
+		// input, but it may have buffered chunks ready).
+		written += s.drainChannelInto(dst[written:])
+		return written, len(s.leftover) > 0, nil
+	}
+
+	m, err := s.sendDelta(delta, dst[written:])
+	written += m
+	if err != nil {
+		return written, len(s.leftover) > 0, err
+	}
+	return written, len(s.leftover) > 0, nil
+}
+
+// EndInto is the zero-allocation variant of End. On the first call it signals
+// EOF to the Patch goroutine; subsequent calls drain any remaining output in
+// dst-sized chunks. Returns morePending=true while output remains; call
+// repeatedly until morePending=false.
+func (s *PatchSession) EndInto(dst []byte) (n int, morePending bool, err error) {
+	if s.err != nil {
+		if s.err == errPatchEnded {
+			return 0, false, nil
+		}
+		return 0, false, s.err
+	}
+	if !s.ended {
+		s.deltaW.Close() // signal EOF; goroutine will close outCh after finishing.
+		s.ended = true
+	}
+
+	written := s.consumeLeftover(dst)
+
+	// Pull from outCh until dst is full or channel closes. Guard against
+	// receiving from a nil channel — once outCh closes we set it to nil and
+	// further receives would block forever.
+	for written < len(dst) && s.outCh != nil {
+		chunk, ok := <-s.outCh
+		if !ok {
+			s.outCh = nil
+			break
+		}
+		written += s.spillIntoDst(chunk, dst[written:])
+	}
+
+	// Once both the channel is closed and no leftover remains, the goroutine
+	// has fully exited — drain errCh exactly once and mark the session done.
+	if s.outCh == nil && len(s.leftover) == 0 {
+		err := <-s.errCh
+		if err != nil {
+			s.err = err
+			return written, false, err
+		}
+		s.err = errPatchEnded
+		return written, false, nil
+	}
+	return written, true, nil
+}
+
+// consumeLeftover writes as many leftover bytes as fit into dst and returns
+// the count. Mutates s.leftover to hold any remainder.
+func (s *PatchSession) consumeLeftover(dst []byte) int {
+	if len(s.leftover) == 0 || len(dst) == 0 {
+		return 0
+	}
+	n := copy(dst, s.leftover)
+	if n == len(s.leftover) {
+		s.leftover = nil
+	} else {
+		s.leftover = s.leftover[n:]
+	}
+	return n
+}
+
+// spillIntoDst copies as much of chunk as fits into dst and appends the rest
+// to s.leftover. Returns bytes written to dst.
+//
+// Append (not assign) matters because sendDelta may receive several chunks in
+// a row when the producer is faster than the consumer's dst can absorb; each
+// overflow must be queued, not overwrite the previous one.
+func (s *PatchSession) spillIntoDst(chunk, dst []byte) int {
+	n := copy(dst, chunk)
+	if n < len(chunk) {
+		s.leftover = append(s.leftover, chunk[n:]...)
+	}
+	return n
+}
+
+// drainChannelInto pulls available chunks from outCh non-blockingly and copies
+// them into dst, spilling overflow into s.leftover. Returns bytes written.
+func (s *PatchSession) drainChannelInto(dst []byte) int {
+	written := 0
+	for written < len(dst) {
+		select {
+		case chunk, ok := <-s.outCh:
+			if !ok {
+				s.outCh = nil
+				return written
+			}
+			written += s.spillIntoDst(chunk, dst[written:])
+			if len(s.leftover) > 0 {
+				return written
+			}
+		default:
+			return written
+		}
+	}
+	return written
+}
+
+// sendDelta writes delta to the pipe in a goroutine and concurrently drains
+// the output channel into dst (preventing deadlock when outCh is full). Any
+// produced output that does not fit in dst is stashed in s.leftover. Returns
+// the number of bytes written to dst.
+func (s *PatchSession) sendDelta(delta, dst []byte) (int, error) {
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := s.deltaW.Write(delta)
+		writeErr <- err
+	}()
+
+	written := 0
+	for {
+		select {
+		case err := <-writeErr:
+			if err != nil {
+				s.err = err
+				return written, err
+			}
+			// Write consumed; non-blocking drain to capture what's already ready.
+			written += s.drainChannelInto(dst[written:])
+			return written, nil
+		case chunk, ok := <-s.outCh:
+			if !ok {
+				s.outCh = nil
+			} else {
+				written += s.spillIntoDst(chunk, dst[written:])
+			}
+		}
+	}
+}
+
 // Close abandons the session without finalizing. Use on the error path when
 // End has not been called. After Close, the session must not be used again.
 func (s *PatchSession) Close() {
@@ -415,6 +704,21 @@ func normalizeEmpty(b []byte) []byte {
 		return []byte{}
 	}
 	return b
+}
+
+// drainInto copies up to len(dst) bytes from buf into dst, removing the copied
+// bytes from buf. Returns the number of bytes written. Any unread bytes remain
+// in buf to be drained on a subsequent call.
+//
+// Note: bytes.Buffer.Read removes consumed bytes from the buffer (it tracks an
+// internal read offset and resets when fully drained), so this is genuinely
+// destructive — no separate Reset is needed.
+func drainInto(buf *bytes.Buffer, dst []byte) int {
+	if buf.Len() == 0 || len(dst) == 0 {
+		return 0
+	}
+	n, _ := buf.Read(dst) // bytes.Buffer.Read never returns an error besides io.EOF (handled above)
+	return n
 }
 
 // drainBuf returns a copy of buf's contents and resets it.
