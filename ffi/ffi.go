@@ -110,6 +110,14 @@ func cInput(ptr *C.uint8_t, n C.size_t) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(n))
 }
 
+// boolToInt32 converts a Go bool to a 1/0 int32 for the C ABI.
+func boolToInt32(b bool) C.int32_t {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // setOutput copies data to C-heap memory and writes the pointer and length to
 // the caller's output parameters. Sets both to zero when data is nil/empty.
 // The caller must librsync_free the returned pointer.
@@ -249,6 +257,63 @@ func librsync_signature_feed(
 	return errOK
 }
 
+// librsync_signature_feed_into is the zero-allocation variant of
+// librsync_signature_feed: instead of allocating an output buffer on the C
+// heap, it writes directly into the caller-owned dst (capacity dstLen). On
+// return, *bytesWritten holds the number of bytes copied (0 .. dstLen) and
+// *morePending is set to 1 iff output remains buffered internally.
+//
+// Drain by passing inputLen=0 repeatedly until *morePending == 0.
+//
+//export librsync_signature_feed_into
+func librsync_signature_feed_into(
+	handle C.intptr_t,
+	inputPtr *C.uint8_t, inputLen C.size_t,
+	dstPtr *C.uint8_t, dstLen C.size_t,
+	bytesWritten *C.size_t,
+	morePending *C.int32_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.SignatureSession)
+	if !ok {
+		return errArgs
+	}
+	n, more, err := sess.FeedInto(cInput(inputPtr, inputLen), cInput(dstPtr, dstLen))
+	if err != nil {
+		return errCorrupt
+	}
+	*bytesWritten = C.size_t(n)
+	*morePending = boolToInt32(more)
+	return errOK
+}
+
+// librsync_signature_end_into is the zero-allocation variant of
+// librsync_signature_end. Drain by calling repeatedly until *morePending == 0.
+// Always invalidates the handle on the call that returns *morePending == 0.
+//
+//export librsync_signature_end_into
+func librsync_signature_end_into(
+	handle C.intptr_t,
+	dstPtr *C.uint8_t, dstLen C.size_t,
+	bytesWritten *C.size_t,
+	morePending *C.int32_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.SignatureSession)
+	if !ok {
+		return errArgs
+	}
+	n, more, err := sess.EndInto(cInput(dstPtr, dstLen))
+	if err != nil {
+		dropHandle(handle)
+		return errCorrupt
+	}
+	*bytesWritten = C.size_t(n)
+	*morePending = boolToInt32(more)
+	if !more {
+		dropHandle(handle)
+	}
+	return errOK
+}
+
 // librsync_signature_end finalizes the session and returns any remaining output.
 // Always invalidates the handle — do NOT call librsync_signature_free after this.
 // Caller must librsync_free(*out_ptr) if *out_len > 0.
@@ -320,6 +385,58 @@ func librsync_delta_feed(
 	return errOK
 }
 
+// librsync_delta_feed_into is the zero-allocation variant of librsync_delta_feed.
+// See librsync_signature_feed_into for semantics.
+//
+//export librsync_delta_feed_into
+func librsync_delta_feed_into(
+	handle C.intptr_t,
+	inputPtr *C.uint8_t, inputLen C.size_t,
+	dstPtr *C.uint8_t, dstLen C.size_t,
+	bytesWritten *C.size_t,
+	morePending *C.int32_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.DeltaSession)
+	if !ok {
+		return errArgs
+	}
+	n, more, err := sess.FeedInto(cInput(inputPtr, inputLen), cInput(dstPtr, dstLen))
+	if err != nil {
+		return errCorrupt
+	}
+	*bytesWritten = C.size_t(n)
+	*morePending = boolToInt32(more)
+	return errOK
+}
+
+// librsync_delta_end_into is the zero-allocation variant of librsync_delta_end.
+// Drain by calling repeatedly until *morePending == 0; the handle is dropped
+// on the call that returns *morePending == 0.
+//
+//export librsync_delta_end_into
+func librsync_delta_end_into(
+	handle C.intptr_t,
+	dstPtr *C.uint8_t, dstLen C.size_t,
+	bytesWritten *C.size_t,
+	morePending *C.int32_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.DeltaSession)
+	if !ok {
+		return errArgs
+	}
+	n, more, err := sess.EndInto(cInput(dstPtr, dstLen))
+	if err != nil {
+		dropHandle(handle)
+		return errCorrupt
+	}
+	*bytesWritten = C.size_t(n)
+	*morePending = boolToInt32(more)
+	if !more {
+		dropHandle(handle)
+	}
+	return errOK
+}
+
 // librsync_delta_end finalizes the session and flushes remaining output.
 // Always invalidates the handle — do NOT call librsync_delta_free after this.
 //
@@ -385,6 +502,58 @@ func librsync_patch_feed(
 		return errCorrupt
 	}
 	setOutput(outPtr, outLen, result)
+	return errOK
+}
+
+// librsync_patch_feed_into is the zero-allocation variant of librsync_patch_feed.
+// See librsync_signature_feed_into for semantics.
+//
+//export librsync_patch_feed_into
+func librsync_patch_feed_into(
+	handle C.intptr_t,
+	deltaPtr *C.uint8_t, deltaLen C.size_t,
+	dstPtr *C.uint8_t, dstLen C.size_t,
+	bytesWritten *C.size_t,
+	morePending *C.int32_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.PatchSession)
+	if !ok {
+		return errArgs
+	}
+	n, more, err := sess.FeedInto(cInput(deltaPtr, deltaLen), cInput(dstPtr, dstLen))
+	if err != nil {
+		return errCorrupt
+	}
+	*bytesWritten = C.size_t(n)
+	*morePending = boolToInt32(more)
+	return errOK
+}
+
+// librsync_patch_end_into is the zero-allocation variant of librsync_patch_end.
+// Drain by calling repeatedly until *morePending == 0; the handle is dropped
+// on the call that returns *morePending == 0.
+//
+//export librsync_patch_end_into
+func librsync_patch_end_into(
+	handle C.intptr_t,
+	dstPtr *C.uint8_t, dstLen C.size_t,
+	bytesWritten *C.size_t,
+	morePending *C.int32_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.PatchSession)
+	if !ok {
+		return errArgs
+	}
+	n, more, err := sess.EndInto(cInput(dstPtr, dstLen))
+	if err != nil {
+		dropHandle(handle)
+		return errCorrupt
+	}
+	*bytesWritten = C.size_t(n)
+	*morePending = boolToInt32(more)
+	if !more {
+		dropHandle(handle)
+	}
 	return errOK
 }
 
